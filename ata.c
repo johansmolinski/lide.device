@@ -445,6 +445,31 @@ BYTE ata_set_multiple(struct IDEUnit *unit, BYTE multiple) {
 #pragma GCC optimize ("-O3")
 
 /**
+ * mm_dma (Megamiga)
+ *
+ * Move count sectors (1..256) of the running command between the board and buffer with
+ * the board's DMA; the board waits for DRQ by itself
+ * @returns 0 done, 1 refused (nothing moved: not Fast RAM - use PIO), -1 failed
+*/
+#define MM_DMA_POLLS 20000000UL
+static int mm_dma(struct IDEUnit *unit, APTR buffer, ULONG count, bool toCard) {
+    volatile UWORD *d = unit->dmaRegs;
+    UWORD st;
+    ULONG n = 0;
+
+    *(volatile ULONG *)(d + 2) = (ULONG)buffer;
+    d[4] = (toCard ? 0x8000 : 0) | (count & 0x1FF);
+    while ((st = d[4]) & 0x8000) {
+        if (++n > MM_DMA_POLLS) {
+            d[4] = 0x4000;                 // abort
+            return -1;
+        }
+    }
+    if (st & 0x4000) return (d[5] == (UWORD)(count << 8)) ? 1 : -1;
+    return 0;
+}
+
+/**
  * ata_read
  *
  * Read blocks from the unit
@@ -458,7 +483,19 @@ BYTE ata_read(void *buffer, uint64_t lba, ULONG count, struct IDEUnit *unit) {
     Trace("ata_read enter\n");
     Trace("ATA: Request sector count: %ld\n",count);
 
+    struct ExecBase *SysBase = unit->SysBase;
     UBYTE error = 0;
+    // Megamiga: DMA for a long-aligned buffer the caches let go of in one piece
+    void *start = buffer;
+    ULONG dmaLen = count << 9;
+    UBYTE *dmaBuf = buffer;
+    bool useDma = unit->dmaRegs && !((ULONG)buffer & 3);
+    bool cached = false;
+    if (useDma && SysBase->LibNode.lib_Version >= 37) {
+        dmaBuf = CachePreDMA(buffer, &dmaLen, 0);
+        cached = true;
+        if (dmaLen != (count << 9)) useDma = false;
+    }
     ULONG txn_count; // Amount of sectors to transfer in the current READ/WRITE command
 
     UBYTE command;
@@ -486,7 +523,8 @@ BYTE ata_read(void *buffer, uint64_t lba, ULONG count, struct IDEUnit *unit) {
 
     if (!ata_wait_ready(unit,ATA_RDY_WAIT_COUNT)) {
         ata_save_error(unit);
-        return HFERR_SelTimeout;
+        error = HFERR_SelTimeout;
+        goto done;
     }
 
     /**
@@ -508,7 +546,7 @@ BYTE ata_read(void *buffer, uint64_t lba, ULONG count, struct IDEUnit *unit) {
 
         if ((error = unit->write_taskfile(unit,command,lba,txn_count,0)) != 0) {
             ata_save_error(unit);
-            return error;
+            goto done;
         }
 
         lba += txn_count;
@@ -516,7 +554,25 @@ BYTE ata_read(void *buffer, uint64_t lba, ULONG count, struct IDEUnit *unit) {
         while (txn_count) {
             if (!ata_wait_drq(unit,ATA_DRQ_WAIT_COUNT,true)) {
                 ata_save_error(unit);
-                return IOERR_UNITBUSY;
+                error = IOERR_UNITBUSY;
+                goto done;
+            }
+
+            // Megamiga: the rest of the command in one DMA
+            if (useDma) {
+                int r = mm_dma(unit, dmaBuf, txn_count, false);
+                if (r == 0) {
+                    buffer += txn_count << 9;
+                    dmaBuf += txn_count << 9;
+                    txn_count = 0;
+                    continue;
+                }
+                if (r < 0) {
+                    ata_save_error(unit);
+                    error = HFERR_DMA;
+                    goto done;
+                }
+                useDma = false;              // refused: PIO from here on
             }
 
             /* Transfer up to (multiple_count) sectors before polling DRQ again */
@@ -524,12 +580,15 @@ BYTE ata_read(void *buffer, uint64_t lba, ULONG count, struct IDEUnit *unit) {
                 ata_xfer((void *)dataRegister,buffer);
                 txn_count--;
                 buffer += 512;
+                dmaBuf += 512;
             }
         }
 
     }
 
-    return 0;
+done:
+    if (cached) CachePostDMA(start, &dmaLen, 0);   // (the length CachePreDMA returned)
+    return error;
 }
 
 /**
@@ -546,7 +605,19 @@ BYTE ata_write(void *buffer, uint64_t lba, ULONG count, struct IDEUnit *unit) {
     Trace("ata_write enter\n");
     Trace("ATA: Request sector count: %ld\n",count);
 
+    struct ExecBase *SysBase = unit->SysBase;
     UBYTE error = 0;
+    // Megamiga: DMA for a long-aligned buffer the caches let go of in one piece
+    void *start = buffer;
+    ULONG dmaLen = count << 9;
+    UBYTE *dmaBuf = buffer;
+    bool useDma = unit->dmaRegs && !((ULONG)buffer & 3);
+    bool cached = false;
+    if (useDma && SysBase->LibNode.lib_Version >= 37) {
+        dmaBuf = CachePreDMA(buffer, &dmaLen, DMA_ReadFromRAM);
+        cached = true;
+        if (dmaLen != (count << 9)) useDma = false;
+    }
 
     ULONG txn_count; // Amount of sectors to transfer in the current READ/WRITE command
 
@@ -575,7 +646,8 @@ BYTE ata_write(void *buffer, uint64_t lba, ULONG count, struct IDEUnit *unit) {
 
     if (!ata_wait_ready(unit,ATA_RDY_WAIT_COUNT)) {
         ata_save_error(unit);
-        return HFERR_SelTimeout;
+        error = HFERR_SelTimeout;
+        goto done;
     }
 
     /**
@@ -597,7 +669,7 @@ BYTE ata_write(void *buffer, uint64_t lba, ULONG count, struct IDEUnit *unit) {
 
         if ((error = unit->write_taskfile(unit,command,lba,txn_count,0)) != 0) {
             ata_save_error(unit);
-            return error;
+            goto done;
         }
 
         lba += txn_count;
@@ -605,7 +677,25 @@ BYTE ata_write(void *buffer, uint64_t lba, ULONG count, struct IDEUnit *unit) {
         while (txn_count) {
             if (!ata_wait_drq(unit,ATA_DRQ_WAIT_COUNT,true)) {
                 ata_save_error(unit);
-                return IOERR_UNITBUSY;
+                error = IOERR_UNITBUSY;
+                goto done;
+            }
+
+            // Megamiga: the rest of the command in one DMA
+            if (useDma) {
+                int r = mm_dma(unit, dmaBuf, txn_count, true);
+                if (r == 0) {
+                    buffer += txn_count << 9;
+                    dmaBuf += txn_count << 9;
+                    txn_count = 0;
+                    continue;
+                }
+                if (r < 0) {
+                    ata_save_error(unit);
+                    error = HFERR_DMA;
+                    goto done;
+                }
+                useDma = false;              // refused: PIO from here on
             }
 
             /* Transfer up to (multiple_count) sectors before polling DRQ again */
@@ -613,12 +703,15 @@ BYTE ata_write(void *buffer, uint64_t lba, ULONG count, struct IDEUnit *unit) {
                 ata_xfer(buffer,(void *)dataRegister);
                 txn_count--;
                 buffer += 512;
+                dmaBuf += 512;
             }
         }
 
     }
 
-    return 0;
+done:
+    if (cached) CachePostDMA(start, &dmaLen, DMA_ReadFromRAM);   // (the length CachePreDMA returned)
+    return error;
 }
 
 /**

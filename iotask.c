@@ -269,7 +269,14 @@ static BYTE init_units(struct IOTask *itask) {
             void *base = itask->cd->cd_BoardAddr;
             base += (itask->channel == 0) ? CHANNEL_0 : CHANNEL_1;
 
+            unit->dmaRegs = NULL;
             if (ata_init_unit(unit,base)) {
+                // Megamiga: DMA on the first channel of a board that has it (the ID and a
+                // version, both read after the init mapped the IDE registers in)
+                if (itask->channel == 0 && !unit->flags.atapi) {
+                    volatile UWORD *d = (volatile UWORD *)((UBYTE *)itask->cd->cd_BoardAddr + MM_DMA_OFFSET);
+                    if (d[0] == MM_DMA_ID && d[1] >= 1 && d[1] < 0x100) unit->dmaRegs = d;
+                }
                 if (unit->flags.atapi) itask->hasRemovables = true;
                 num_units++;
                 itask->dev->numUnits++;

@@ -84,6 +84,7 @@ struct IDEUnit {
     uint64_t logicalSectors;
     struct MinList changeInts;
     UBYTE multipleCount;
+    volatile UWORD *dmaRegs;   // Megamiga: the board's DMA registers (NULL: no DMA)
     struct {
         unsigned char primary : 1;
         unsigned char present : 1;
@@ -144,7 +145,14 @@ struct IOTask {
 #define DEVICE_NAME "scsi.device"
 #endif
 
-#define DEVICE_ID_STRING "lide " XSTR(DEVICE_VERSION) "." XSTR(DEVICE_REVISION) " (" XSTR(BUILD_DATE) ") " XSTR(GIT_REF)
+//#define DEVICE_ID_STRING "lide " XSTR(DEVICE_VERSION) "." XSTR(DEVICE_REVISION) " (" XSTR(BUILD_DATE) ") " XSTR(GIT_REF)
+// Megamiga: the DMA path (ata.c, mm_dma) is named in the ID string
+#define DEVICE_ID_STRING "lide " XSTR(DEVICE_VERSION) "." XSTR(DEVICE_REVISION) " (" XSTR(BUILD_DATE) ") " XSTR(GIT_REF) " (Megamiga DMA 1)"
+
+// Megamiga: the IDE DMA of the Megamiga core's board (ide_board.vhd), at board offset $A000
+// (words): 0 = $444D 'DM', 1 = version, 2/3 = buffer address, 4 = control/status, 5 = words left
+#define MM_DMA_OFFSET 0xA000
+#define MM_DMA_ID     0x444D
 
 // The build process will define the version/revision based on the latest git tag
 #ifndef DEVICE_VERSION
