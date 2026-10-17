@@ -441,9 +441,6 @@ BYTE ata_set_multiple(struct IDEUnit *unit, BYTE multiple) {
     return 0;
 }
 
-#pragma GCC push_options
-#pragma GCC optimize ("-O3")
-
 /**
  * mm_dma (Megamiga)
  *
@@ -452,7 +449,7 @@ BYTE ata_set_multiple(struct IDEUnit *unit, BYTE multiple) {
  * @returns 0 done, 1 refused (nothing moved: not Fast RAM - use PIO), -1 failed
 */
 #define MM_DMA_POLLS 20000000UL
-static int mm_dma(struct IDEUnit *unit, APTR buffer, ULONG count, bool toCard) {
+static __attribute__((noinline)) int mm_dma(struct IDEUnit *unit, APTR buffer, ULONG count, bool toCard) {
     volatile UWORD *d = unit->dmaRegs;
     UWORD st;
     ULONG n = 0;
@@ -470,6 +467,45 @@ static int mm_dma(struct IDEUnit *unit, APTR buffer, ULONG count, bool toCard) {
 }
 
 /**
+ * mm_dma_begin / mm_dma_end (Megamiga)
+ *
+ * DMA for a long-aligned buffer the caches let go of in one piece (CachePreDMA/CachePostDMA,
+ * exec V37+; flags: 0 = the board writes memory, DMA_ReadFromRAM = it reads it)
+ * @returns the address for the board, NULL: use PIO
+*/
+struct mm_dma_state {
+    void *start;
+    ULONG len;
+    ULONG flags;
+    bool cached;
+};
+
+static __attribute__((noinline)) UBYTE *mm_dma_begin(struct IDEUnit *unit, void *buffer, ULONG count,
+                                                     ULONG flags, struct mm_dma_state *ds) {
+    struct ExecBase *SysBase = unit->SysBase;
+    UBYTE *a = buffer;
+    ds->start  = buffer;
+    ds->len    = count << 9;
+    ds->flags  = flags;
+    ds->cached = false;
+    if (!unit->dmaRegs || ((ULONG)buffer & 3)) return NULL;
+    if (SysBase->LibNode.lib_Version >= 37) {
+        a = CachePreDMA(buffer, &ds->len, flags);
+        ds->cached = true;
+        if (ds->len != (count << 9)) return NULL;
+    }
+    return a;
+}
+
+static __attribute__((noinline)) void mm_dma_end(struct IDEUnit *unit, struct mm_dma_state *ds) {
+    struct ExecBase *SysBase = unit->SysBase;
+    if (ds->cached) CachePostDMA(ds->start, &ds->len, ds->flags);   // (the length CachePreDMA returned)
+}
+
+#pragma GCC push_options
+#pragma GCC optimize ("-O3")
+
+/**
  * ata_read
  *
  * Read blocks from the unit
@@ -479,23 +515,17 @@ static int mm_dma(struct IDEUnit *unit, APTR buffer, ULONG count, bool toCard) {
  * @param unit Pointer to the unit structure
  * @returns error
 */
+// Megamiga: -Os (the ROM is full; the copy loops are blockcopy.h's, called per sector)
+__attribute__((optimize("Os")))
 BYTE ata_read(void *buffer, uint64_t lba, ULONG count, struct IDEUnit *unit) {
     Trace("ata_read enter\n");
     Trace("ATA: Request sector count: %ld\n",count);
 
-    struct ExecBase *SysBase = unit->SysBase;
     UBYTE error = 0;
-    // Megamiga: DMA for a long-aligned buffer the caches let go of in one piece
-    void *start = buffer;
-    ULONG dmaLen = count << 9;
-    UBYTE *dmaBuf = buffer;
-    bool useDma = unit->dmaRegs && !((ULONG)buffer & 3);
-    bool cached = false;
-    if (useDma && SysBase->LibNode.lib_Version >= 37) {
-        dmaBuf = CachePreDMA(buffer, &dmaLen, 0);
-        cached = true;
-        if (dmaLen != (count << 9)) useDma = false;
-    }
+    // Megamiga: DMA when the buffer allows it (mm_dma_begin)
+    struct mm_dma_state ds;
+    UBYTE *dmaBuf = mm_dma_begin(unit, buffer, count, 0, &ds);
+    bool useDma = dmaBuf != NULL;
     ULONG txn_count; // Amount of sectors to transfer in the current READ/WRITE command
 
     UBYTE command;
@@ -580,14 +610,13 @@ BYTE ata_read(void *buffer, uint64_t lba, ULONG count, struct IDEUnit *unit) {
                 ata_xfer((void *)dataRegister,buffer);
                 txn_count--;
                 buffer += 512;
-                dmaBuf += 512;
             }
         }
 
     }
 
 done:
-    if (cached) CachePostDMA(start, &dmaLen, 0);   // (the length CachePreDMA returned)
+    mm_dma_end(unit, &ds);
     return error;
 }
 
@@ -601,23 +630,17 @@ done:
  * @param unit Pointer to the unit structure
  * @returns error
 */
+// Megamiga: -Os (the ROM is full; the copy loops are blockcopy.h's, called per sector)
+__attribute__((optimize("Os")))
 BYTE ata_write(void *buffer, uint64_t lba, ULONG count, struct IDEUnit *unit) {
     Trace("ata_write enter\n");
     Trace("ATA: Request sector count: %ld\n",count);
 
-    struct ExecBase *SysBase = unit->SysBase;
     UBYTE error = 0;
-    // Megamiga: DMA for a long-aligned buffer the caches let go of in one piece
-    void *start = buffer;
-    ULONG dmaLen = count << 9;
-    UBYTE *dmaBuf = buffer;
-    bool useDma = unit->dmaRegs && !((ULONG)buffer & 3);
-    bool cached = false;
-    if (useDma && SysBase->LibNode.lib_Version >= 37) {
-        dmaBuf = CachePreDMA(buffer, &dmaLen, DMA_ReadFromRAM);
-        cached = true;
-        if (dmaLen != (count << 9)) useDma = false;
-    }
+    // Megamiga: DMA when the buffer allows it (mm_dma_begin)
+    struct mm_dma_state ds;
+    UBYTE *dmaBuf = mm_dma_begin(unit, buffer, count, DMA_ReadFromRAM, &ds);
+    bool useDma = dmaBuf != NULL;
 
     ULONG txn_count; // Amount of sectors to transfer in the current READ/WRITE command
 
@@ -703,14 +726,13 @@ BYTE ata_write(void *buffer, uint64_t lba, ULONG count, struct IDEUnit *unit) {
                 ata_xfer(buffer,(void *)dataRegister);
                 txn_count--;
                 buffer += 512;
-                dmaBuf += 512;
             }
         }
 
     }
 
 done:
-    if (cached) CachePostDMA(start, &dmaLen, DMA_ReadFromRAM);   // (the length CachePreDMA returned)
+    mm_dma_end(unit, &ds);
     return error;
 }
 
